@@ -129,6 +129,15 @@ def pyramid(x1, x2, y, z1, z2, fill=False):
         result |= cuboid(x1, x2, y, y, z1, z2, fill)
         y, x1, x2, z1, z2 = y + 1, x1 + 1, x2 - 1, z1 + 1, z2 - 1
     return result
+    
+def upyramid(x1, x2, y, z1, z2, fill=False):
+    x1, x2 = sorted((x1, x2))
+    z1, z2 = sorted((z1, z2))
+    result = set()
+    while x2 >= x1 and z2 >= z2:
+        result |= cuboid(x1, x2, y, y, z1, z2, fill)
+        y, x1, x2, z1, z2 = y - 1, x1 + 1, x2 - 1, z1 + 1, z2 - 1
+    return result
 
 class Client(object):
     def __init__(self, host, port, username, identity_token):

@@ -42,6 +42,6 @@ class PyBuild(Frame):
 root = Tk()
 pybuild = PyBuild(master=root)
 pybuild.master.title("Pyramid Builder for Craft")
-pybuild.master.minsize(768, 480)
+pybuild.master.maxsize(768, 480)
 pybuild.mainloop()
 root.destroy()

@@ -102,8 +102,35 @@ def cylinder_z(x, y, z1, z2, r, fill=False):
     for z in range(z1, z2 + 1):
         result |= circle_z(x, y, z, r, fill)
     return result
+    
+def cone_y(x, y1, y2, z, r, fill=False):
+    y1, y2 = sorted((y1, y2))
+    result = set()
+    for y in range(y1, y2):
+        result |= circle_y(x, y, z, r, fill)
+        y += 1
+        r -= 1
+        return result
 
 def cuboid(x1, x2, y1, y2, z1, z2, fill=True):
+    x1, x2 = sorted((x1, x2))
+    y1, y2 = sorted((y1, y2))
+    z1, z2 = sorted((z1, z2))
+    result = set()
+    a = (x1 == x2) + (y1 == y2) + (z1 == z2)
+    for x in range(x1, x2 + 1):
+        for y in range(y1, y2 + 1):
+            for z in range(z1, z2 + 1):
+                n = 0
+                n += x in (x1, x2)
+                n += y in (y1, y2)
+                n += z in (z1, z2)
+                if not fill and n <= a:
+                    continue
+                result.add((x, y, z))
+    return result
+    
+def cuboid1(x1, x2, y1, y2, z1, z2, fill=False):
     x1, x2 = sorted((x1, x2))
     y1, y2 = sorted((y1, y2))
     z1, z2 = sorted((z1, z2))

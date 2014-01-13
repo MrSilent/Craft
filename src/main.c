@@ -1,14 +1,17 @@
 #ifdef _WIN32
+    #include <winsock2.h>
     #include <windows.h>
 #endif
 
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
+#include <curl/curl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "auth.h"
 #include "client.h"
 #include "config.h"
 #include "cube.h"
@@ -95,6 +98,7 @@ static int item_index = 0;
 static int scale = 1;
 static int ortho = 0;
 static float fov = 65;
+static int suppress_char = 0;
 static int typing = 0;
 static char typing_buffer[MAX_TEXT_LENGTH] = {0};
 static int message_index = 0;
@@ -899,6 +903,11 @@ void gen_chunk_buffer(Chunk *chunk) {
     chunk->dirty = 0;
 }
 
+void map_set_func(int x, int y, int z, int w, void *arg) {
+    Map *map = (Map *)arg;
+    map_set(map, x, y, z, w);
+}
+
 void create_chunk(Chunk *chunk, int p, int q) {
     chunk->p = p;
     chunk->q = q;
@@ -911,7 +920,7 @@ void create_chunk(Chunk *chunk, int p, int q) {
     SignList *signs = &chunk->signs;
     map_alloc(map);
     sign_list_alloc(signs, 16);
-    create_world(map, p, q);
+    create_world(p, q, map_set_func, map);
     db_load_map(map, p, q);
     db_load_signs(signs, p, q);
     gen_chunk_buffer(chunk);
@@ -1290,6 +1299,60 @@ void render_text(
     del_buffer(buffer);
 }
 
+void add_message(const char *text) {
+    printf("%s\n", text);
+    snprintf(
+        messages[message_index], MAX_TEXT_LENGTH, "%s", text);
+    message_index = (message_index + 1) % MAX_MESSAGES;
+}
+
+void login() {
+    char username[128] = {0};
+    char identity_token[128] = {0};
+    char access_token[128] = {0};
+    if (db_auth_get_selected(username, 128, identity_token, 128)) {
+        printf("Contacting login server for username: %s\n", username);
+        if (get_access_token(
+            access_token, 128, username, identity_token))
+        {
+            printf("Successfully authenticated with the login server\n");
+            client_login(username, access_token);
+        }
+        else {
+            printf("Failed to authenticate with the login server\n");
+            client_login("", "");
+        }
+    }
+    else {
+        printf("Logging in anonymously\n");
+        client_login("", "");
+    }
+}
+
+void parse_command(const char *buffer, int forward) {
+    char username[128] = {0};
+    char token[128] = {0};
+    if (sscanf(buffer, "/identity %128s %128s", username, token) == 2) {
+        db_auth_set(username, token);
+        add_message("Successfully imported identity token!");
+    }
+    else if (strstr(buffer, "/logout") == buffer) {
+        db_auth_select_none();
+        login();
+    }
+    else if (sscanf(buffer, "/login %128s", username) == 1) {
+        if (db_auth_select(username)) {
+            login();
+        }
+        else {
+            add_message("Unknown username.");
+        }
+    }
+    else if (forward) {
+        client_talk(buffer);
+    }
+}
+
 void on_key(GLFWwindow *window, int key, int scancode, int action, int mods) {
     if (action == GLFW_RELEASE) {
         return;
@@ -1332,6 +1395,9 @@ void on_key(GLFWwindow *window, int key, int scancode, int action, int mods) {
                         set_sign(x, y, z, face, typing_buffer + 1);
                     }
                 }
+                else if (typing_buffer[0] == '/') {
+                    parse_command(typing_buffer, 1);
+                }
                 else {
                     client_talk(typing_buffer);
                 }
@@ -1344,6 +1410,18 @@ void on_key(GLFWwindow *window, int key, int scancode, int action, int mods) {
             else {
                 left_click = 1;
             }
+        }
+    }
+    int control = mods & (GLFW_MOD_CONTROL | GLFW_MOD_SUPER);
+    if (control && key == 'V') {
+        const char *buffer = glfwGetClipboardString(window);
+        if (typing) {
+            suppress_char = 1;
+            strncat(typing_buffer, buffer,
+                MAX_TEXT_LENGTH - strlen(typing_buffer) - 1);
+        }
+        else {
+            parse_command(buffer, 0);
         }
     }
     if (!typing) {
@@ -1375,6 +1453,10 @@ void on_key(GLFWwindow *window, int key, int scancode, int action, int mods) {
 }
 
 void on_char(GLFWwindow *window, unsigned int u) {
+    if (suppress_char) {
+        suppress_char = 0;
+        return;
+    }
     if (typing) {
         if (u >= 32 && u < 128) {
             char c = (char)u;
@@ -1524,24 +1606,6 @@ void handle_movement(double dt) {
                 dy = 8;
             }
         }
-        if (glfwGetKey(window, CRAFT_KEY_XM)) {
-            vx = -1; vy = 0; vz = 0;
-        }
-        if (glfwGetKey(window, CRAFT_KEY_XP)) {
-            vx = 1; vy = 0; vz = 0;
-        }
-        if (glfwGetKey(window, CRAFT_KEY_YM)) {
-            vx = 0; vy = -1; vz = 0;
-        }
-        if (glfwGetKey(window, CRAFT_KEY_YP)) {
-            vx = 0; vy = 1; vz = 0;
-        }
-        if (glfwGetKey(window, CRAFT_KEY_ZM)) {
-            vx = 0; vy = 0; vz = -1;
-        }
-        if (glfwGetKey(window, CRAFT_KEY_ZP)) {
-            vx = 0; vy = 0; vz = 1;
-        }
     }
     float speed = flying ? 20 : 5;
     int estimate = roundf(sqrtf(
@@ -1656,7 +1720,9 @@ void parse_buffer(char *buffer) {
         }
         int kp, kq, kk;
         if (sscanf(line, "K,%d,%d,%d", &kp, &kq, &kk) == 3) {
-            db_set_key(kp, kq, kk);
+            if (kk > 0) {
+                db_set_key(kp, kq, kk);
+            }
             Chunk *chunk = find_chunk(kp, kq);
             if (chunk) {
                 chunk->dirty = 1;
@@ -1664,10 +1730,7 @@ void parse_buffer(char *buffer) {
         }
         if (line[0] == 'T' && line[1] == ',') {
             char *text = line + 2;
-            printf("%s\n", text);
-            snprintf(
-                messages[message_index], MAX_TEXT_LENGTH, "%s", text);
-            message_index = (message_index + 1) % MAX_MESSAGES;
+            add_message(text);
         }
         char format[64];
         snprintf(
@@ -1695,10 +1758,11 @@ void parse_buffer(char *buffer) {
 
 int main(int argc, char **argv) {
     // INITIALIZATION //
-    #ifdef _WIN32
-        WSADATA wsa_data;
-        WSAStartup(MAKEWORD(2, 2), &wsa_data);
-    #endif
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    // #ifdef _WIN32
+    //     WSADATA wsa_data;
+    //     WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    // #endif
     srand(time(NULL));
     rand();
 
@@ -1723,6 +1787,7 @@ int main(int argc, char **argv) {
         client_connect(hostname, port);
         client_start();
         client_version(1);
+        login();
     }
     else {
         db_enable();
@@ -2029,5 +2094,6 @@ int main(int argc, char **argv) {
     db_close();
     glfwTerminate();
     client_stop();
+    curl_global_cleanup();
     return 0;
 }

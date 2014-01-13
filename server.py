@@ -4,11 +4,13 @@ import SocketServer
 import datetime
 import random
 import re
+import requests
 import sqlite3
 import sys
 import threading
 import time
 import traceback
+import world
 
 DEFAULT_HOST = '0.0.0.0'
 DEFAULT_PORT = 4080
@@ -28,6 +30,7 @@ ALLOWED_ITEMS = set([
     32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
     48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63])
 
+AUTHENTICATE = 'A'
 BLOCK = 'B'
 CHUNK = 'C'
 DISCONNECT = 'D'
@@ -38,6 +41,11 @@ SIGN = 'S'
 TALK = 'T'
 VERSION = 'V'
 YOU = 'U'
+
+try:
+    from config import *
+except ImportError:
+    pass
 
 def log(*args):
     now = datetime.datetime.utcnow()
@@ -79,6 +87,9 @@ class Handler(SocketServer.BaseRequestHandler):
         self.position_limiter = RateLimiter(100, 5)
         self.limiter = RateLimiter(1000, 10)
         self.version = None
+        self.client_id = None
+        self.user_id = None
+        self.nick = None
         self.queue = Queue.Queue()
         self.running = True
         self.start()
@@ -150,6 +161,7 @@ class Model(object):
         self.clients = []
         self.queue = Queue.Queue()
         self.commands = {
+            AUTHENTICATE: self.on_authenticate,
             CHUNK: self.on_chunk,
             BLOCK: self.on_block,
             POSITION: self.on_position,
@@ -158,12 +170,11 @@ class Model(object):
             VERSION: self.on_version,
         }
         self.patterns = [
-            (re.compile(r'^/nick(?:\s+([^,\s]+))?$'), self.on_nick),
             (re.compile(r'^/spawn$'), self.on_spawn),
             (re.compile(r'^/goto(?:\s+(\S+))?$'), self.on_goto),
             (re.compile(r'^/pq\s+(-?[0-9]+)\s*,?\s*(-?[0-9]+)$'), self.on_pq),
             (re.compile(r'^/help$'), self.on_help),
-            (re.compile(r'^/players$'), self.on_players),
+            (re.compile(r'^/list$'), self.on_list),
         ]
     def start(self):
         thread = threading.Thread(target=self.run)
@@ -221,6 +232,20 @@ class Model(object):
         ]
         for query in queries:
             self.execute(query)
+    def get_default_block(self, x, y, z):
+        p, q = chunked(x), chunked(z)
+        chunk = world.create_world(p, q)
+        return chunk.get((x, y, z), 0)
+    def get_block(self, x, y, z):
+        query = (
+            'select w from block where '
+            'p = :p and q = :q and x = :x and y = :y and z = :z;'
+        )
+        p, q = chunked(x), chunked(z)
+        rows = list(self.execute(query, dict(p=p, q=q, x=x, y=y, z=z)))
+        if rows:
+            return rows[0][0]
+        return self.get_default_block(x, y, z)
     def next_client_id(self):
         result = 1
         client_ids = set(x.client_id for x in self.clients)
@@ -229,7 +254,7 @@ class Model(object):
         return result
     def on_connect(self, client):
         client.client_id = self.next_client_id()
-        client.nick = 'player%d' % client.client_id
+        client.nick = 'guest%d' % client.client_id
         log('CONN', client.client_id, *client.client_address)
         client.position = SPAWN_POINT
         self.clients.append(client)
@@ -240,7 +265,6 @@ class Model(object):
         self.send_positions(client)
         self.send_nick(client)
         self.send_nicks(client)
-        self.send_talk('%s has joined the game.' % client.nick)
     def on_data(self, client, data):
         #log('RECV', client.client_id, data)
         args = data.split(',')
@@ -262,6 +286,26 @@ class Model(object):
             return
         client.version = version
         # TODO: client.start() here
+    def on_authenticate(self, client, username, access_token):
+        user_id = None
+        if username and access_token:
+            url = 'https://craft.michaelfogleman.com/api/1/access'
+            payload = {
+                'username': username,
+                'access_token': access_token,
+            }
+            response = requests.post(url, data=payload)
+            if response.status_code == 200 and response.text.isdigit():
+                user_id = int(response.text)
+        client.user_id = user_id
+        if user_id is None:
+            client.nick = 'guest%d' % client.client_id
+            client.send(TALK, 'Visit craft.michaelfogleman.com to register!')
+        else:
+            client.nick = username
+        self.send_nick(client)
+        # TODO: has left message if was already authenticated
+        self.send_talk('%s has joined the game.' % client.nick)
     def on_chunk(self, client, p, q, key=0):
         p, q, key = map(int, (p, q, key))
         query = (
@@ -284,11 +328,19 @@ class Model(object):
             client.send(SIGN, p, q, x, y, z, face, text)
     def on_block(self, client, x, y, z, w):
         x, y, z, w = map(int, (x, y, z, w))
-        if y <= 0 or y > 255:
-            return
-        if w not in ALLOWED_ITEMS:
-            return
         p, q = chunked(x), chunked(z)
+        message = None
+        if client.user_id is None:
+            message = 'Only logged in users are allowed to build.'
+        elif y <= 0 or y > 255:
+            message = 'Invalid block coordinates.'
+        elif w not in ALLOWED_ITEMS:
+            message = 'That item is not allowed.'
+        if message is not None:
+            client.send(BLOCK, p, q, x, y, z, self.get_block(x, y, z))
+            client.send(KEY, p, q, 0)
+            client.send(TALK, message)
+            return
         query = (
             'insert or replace into block (p, q, x, y, z, w) '
             'values (:p, :q, :x, :y, :z, :w);'
@@ -313,6 +365,9 @@ class Model(object):
             )
             self.execute(query, dict(x=x, y=y, z=z))
     def on_sign(self, client, x, y, z, face, *args):
+        if client.user_id is None:
+            client.send(TALK, 'Only logged in users are allowed to build.')
+            return
         text = ','.join(args)
         x, y, z, face = map(int, (x, y, z, face))
         if y <= 0 or y > 255:
@@ -394,8 +449,8 @@ class Model(object):
         client.send(TALK, 'Type "t" to chat with other players.')
         client.send(TALK, 'Type "/" to start typing a command.')
         client.send(TALK,
-            'Commands: /goto [NAME], /help, /nick [NAME], /players, /spawn')
-    def on_players(self, client):
+            'Commands: /goto [NAME], /help, /list, /spawn')
+    def on_list(self, client):
         client.send(TALK,
             'Players: %s' % ', '.join(x.nick for x in self.clients))
     def send_positions(self, client):
